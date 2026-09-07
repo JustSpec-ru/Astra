@@ -1,0 +1,242 @@
+import asyncio
+import os
+import uuid
+import pygame
+import sounddevice as sd
+import numpy as np
+from faster_whisper import WhisperModel
+import edge_tts
+import webrtcvad
+import torch
+import webbrowser
+import subprocess
+import datetime
+import time
+import random
+
+# ===================== НАСТРОЙКИ =====================
+MODEL_SIZE = "small"
+DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
+COMPUTE_TYPE = "float16" if DEVICE == "cuda" else "int8"
+
+VOICE = "ru-RU-SvetlanaNeural"
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+FRAME_DURATION = 30  # ms (10, 20 или 30 — только эти значения поддерживает webrtcvad)
+
+# Чувствительность VAD: 0 = менее агрессивный, 3 = очень агрессивный
+VAD_MODE = 2
+
+vad = webrtcvad.Vad(VAD_MODE)
+
+# Загружаем модель
+model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+# ====================================================
+
+def is_speech(frame: np.ndarray) -> bool:
+    """Проверяет, есть ли речь в фрейме (16-bit PCM)"""
+    # Преобразуем float32 [-1..1] в int16
+    pcm = (frame * 32767).astype(np.int16)
+    return vad.is_speech(pcm.tobytes(), SAMPLE_RATE)
+
+
+async def speak(text: str):
+    if not text.strip():
+        return
+    filename = f"tts_{uuid.uuid4().hex}.mp3"
+    communicate = edge_tts.Communicate(text, VOICE)
+    await communicate.save(filename)
+    
+    pygame.mixer.init()
+    pygame.mixer.music.load(filename)
+    pygame.mixer.music.play()
+    
+    while pygame.mixer.music.get_busy():
+        pygame.time.Clock().tick(10)
+    
+    pygame.mixer.quit()
+    if os.path.exists(filename):
+        os.remove(filename)
+
+
+def record_with_vad(max_duration=15, silence_threshold=1.2):
+    """Запись с автоостановкой по тишине"""
+    print("Astra слушает...")
+    
+    buffer = []
+    silence_counter = 0
+    max_silence_frames = int(silence_threshold * 1000 / FRAME_DURATION)
+    
+    def audio_callback(indata, frames, time, status):
+        if status:
+            print(status)
+        buffer.append(indata.copy())
+    
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='float32',
+                        blocksize=int(SAMPLE_RATE * FRAME_DURATION / 1000),
+                        callback=audio_callback):
+        
+        while True:
+            sd.sleep(FRAME_DURATION)  # ждём один фрейм
+            
+            if not buffer:
+                continue
+                
+            latest_frame = buffer[-1]
+            speech = is_speech(latest_frame)
+            
+            if speech:
+                silence_counter = 0
+            else:
+                silence_counter += 1
+            
+            # Если тишина больше порога — останавливаемся
+            if silence_counter >= max_silence_frames and len(buffer) > 5:
+                print("Тишина обнаружена → запись остановлена")
+                break
+            
+            # Защита от слишком длинной записи
+            if len(buffer) * FRAME_DURATION / 1000 > max_duration:
+                print("Достигнут максимум длительности")
+                break
+    
+    # Склеиваем всё в один массив
+    audio = np.concatenate(buffer, axis=0)
+    return np.squeeze(audio)
+
+
+def transcribe(audio_data):
+    segments, info = model.transcribe(
+        audio_data,
+        beam_size=5,
+        language="ru",
+        vad_filter=True,      # дополнительный VAD от faster-whisper
+        vad_parameters=dict(min_silence_duration_ms=500)
+    )
+    text = "".join(segment.text for segment in segments).strip()
+    print(f"Распознано: {text}")
+    return text
+
+
+
+
+
+
+
+
+
+# Команды для распознавания
+def greetings():
+    asyncio.run(speak(random.choice([
+        "Приветствую тебя! Я Astra, твой персональный помощник. Чем могу помочь?",
+        "Здравствуй! Рад тебя слышать!",
+        "Приветствую тебя!"
+    ])))
+
+def feeling():
+    feelings = [
+        "Я чувствую себя отлично, спасибо что спросил!",
+        "У меня все хорошо, рада тебя слышать!",
+        "Я в прекрасном настроении, спасибо за заботу!",
+         "Я чувствую себя замечательно, рада быть с тобой!",
+         "У меня все отлично, спасибо за интерес к моему состоянию!",
+         "Я в хорошем настроении, рада, что ты интересуешься моим состоянием!",
+         "Я чувствую себя прекрасно, спасибо за заботу и внимание!",
+         "У меня все хорошо, рада, что ты интересуешься моим состоянием!"
+    ]
+    asyncio.run(speak(random.choice(feelings)))
+
+def tell_time():
+    now = datetime.datetime.now()
+    current_time = now.strftime("%H:%M")
+    current_date = now.strftime("%d %B %Y")
+    asyncio.run(speak(f"Сейчас {current_time} | {current_date}"))
+
+def tell_joke():
+    asyncio.run(speak(random.choice([
+        "Почему программисты не любят природу? Потому что там слишком много багов.",
+        "Как программист называет свою жену? - 'Моя любимая переменная'.",
+        "Почему программисты всегда путают Рождество и Хэллоуин? Потому что Октябрь 31 == Декабрь 25."
+    ])))
+def open_google():
+    asyncio.run(speak(random.choice([
+        "Открываю Google...",
+        "Сейчас открою Google для тебя...",
+        "Пожалуйста, подожди, я открываю Google..."
+    ])))
+    webbrowser.open("https://www.google.com")
+
+def game_mode():
+    modes = [
+        "Режим игры активирован!",
+        "Готовся... Включаю игровой режим!",
+        "Игровой режим активирован!"
+    ]
+    asyncio.run(speak(random.choice(modes)))
+    subprocess.Popen(r"C:\Program Files (x86)\Steam\steam.exe")
+    time.sleep(0.8)
+    asyncio.run(speak(random.choice([
+        "Готово! Наслаждайся игрой!",
+        "Все готово! Удачной игры!",
+        "Готово! Хорошей игры!"
+    ])))
+def chill_mode():
+    modes = [
+        "Режим отдыха активирован! Как ты хочешь отдохнуть? Я могу включить музыку, открыть YouTube или что-то ещё!",
+        "Готов к отдыху! ты предпочитаешь музыку, видео или что-то другое? Я могу помочь тебе расслабиться!",
+        "Режим отдыха включен! Как ты хочешь провести время? Я могу включить музыку, открыть YouTube или что-то ещё, чтобы ты мог отдохнуть!"
+    ]
+    asyncio.run(speak(random.choice(modes)))
+    
+def goodbye():
+    asyncio.run(speak(random.choice([
+        "Выключаюсь... До скорой встречи!",
+        "Пока! Я всегда рядом, если что!",
+        "До свидания! Если что — я всегда рядом!"
+    ])))
+    exit()
+
+print("Астра готова к работе!")
+asyncio.run(speak(random.choice([
+    "Астра готова к работе!",
+    "Приветствую тебя! Чем могу помочь?",
+    ])))
+
+while True:
+    audio = record_with_vad (max_duration=15, silence_threshold=1.5)
+    if len(audio) < SAMPLE_RATE * 1.5:  # меньше 1.5 секунды
+        continue
+
+    text = transcribe(audio)
+    if not text:
+        continue
+    
+    if any(greet in text.lower() for greet in ["привет", "здравствуй", "добрый день"]):
+        greetings()
+    
+    if any(feel in text.lower() for feel in ["как дела", "как ты", "чувствуешь"]):
+        feeling()
+    if any(time_q in text.lower() for time_q in ["который час", "сколько времени", "какая дата"]):
+        tell_time()
+    if any(joke_q in text.lower() for joke_q in ["расскажи шутку", "пошути", "расскажи анекдот"]):
+        tell_joke()
+    if any(google_q in text.lower() for google_q in ["открой гугл", "запусти гугл", "открой браузер", "запусти браузер", "открой Google", "запусти Google"]):
+        open_google()
+    if any(game_q in text.lower() for game_q in ["игровой режим", "включи игровой режим", "активируй игровой режим"]):
+        game_mode()
+    if any(chill_q in text.lower() for chill_q in ["режим отдыха", "включи режим отдыха", "активируй режим отдыха"]):
+        chill_mode()
+    if any(bye_q in text.lower() for bye_q in ["пока", "до свидания", "выключись"]):
+        goodbye()
+    else:
+        asyncio.run(speak("Команда не распознана."))
+
+
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        print("\nЗавершение работы...")
